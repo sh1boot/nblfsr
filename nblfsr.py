@@ -57,7 +57,7 @@ def factorise_backup(n, b1=10000, b2=1000000):
             t = (t ** 2 + c) % n
             g = math.gcd(t - h, n)
             b2 -= 1
-            if b2 == 0: raise OverflowError("Too hard to factor {n}")
+            if b2 == 0: raise OverflowError(f"Too hard to factor {n}")
         if is_prime(g):
             while n % g == 0:
                 fs.append(g)
@@ -76,67 +76,69 @@ def factorise_backup(n, b1=10000, b2=1000000):
 
 
 def _factorise_1(n):
-      timeout = 180
-      if timeout > 0:
+    timeout = 180
+    if timeout > 0:
         try:
-          factors = subprocess.check_output(["factor", str(n)], timeout=timeout, text=True)
-          return tuple(map(int, factors.split(' ')[1:]))
+            factors = subprocess.check_output(["factor", str(n)], timeout=timeout, text=True)
+            return tuple(map(int, factors.split(' ')[1:]))
         except subprocess.CalledProcessError as e:
-          print(f"factor command failed: {e}")
+            print(f"factor command failed: {e}")
         except subprocess.TimeoutExpired:
-          print(f"timeout while waiting for factor {n}", flush=True, file=sys.stderr)
-      return tuple(sorted(factorise_backup(n)))
+            print(f"timeout while waiting for factor {n}", flush=True, file=sys.stderr)
+    return tuple(sorted(factorise_backup(n)))
 
 
 def _factorise_p(base, exp):
-  def allfactors(n):
-    halfway = int(math.sqrt(n))
-    for i in range(2, halfway):
-      if n % i == 0: yield i
-    for i in range(halfway, 1, -1):
-      if n % i == 0: yield n // i
+    def allfactors(n):
+        halfway = int(math.sqrt(n))
+        for i in range(2, halfway):
+            if n % i == 0: yield i
+        for i in range(halfway, 1, -1):
+            if n % i == 0: yield n // i
 
-  seen = set()
-  factors = []
-  n = base ** exp - 1
-  for f in allfactors(exp):
-    newprimes = set(factorise(base, f)) - seen
-    seen |= newprimes
-    for p in newprimes:
-      while n % p == 0:
-        n //= p
-        factors.append(p)
-    if n == 1: break
-  if n > 1: factors.extend(factorise(n))
-  factors.sort()
-  return factors
+    seen = set()
+    factors = []
+    n = base ** exp - 1
+    for f in allfactors(exp):
+        newprimes = set(factorise(base, f)) - seen
+        seen |= newprimes
+        for p in newprimes:
+            while n % p == 0:
+                n //= p
+                factors.append(p)
+        if n == 1: break
+    if n > 1: factors.extend(factorise(n))
+    factors.sort()
+    return factors
 
 
 FACTORLIST = {}
 def factorise(base, exp=None):
-  global FACTORLIST
-  if len(FACTORLIST) == 0:
-    with open('factorlist.txt', 'rt') as f:
-      for line in f:
-        value, factors = line.split(':')
-        factors = factors.strip().split(' ')
-        value = int(value)
-        factors = tuple(map(int, factors))
-        assert math.prod(factors) == value
-        FACTORLIST[value] = factors
+    if len(FACTORLIST) == 0:
+        with open('factorlist.txt', 'rt') as f:
+            for line in f:
+                value, factors = line.split(':')
+                factors = factors.strip().split(' ')
+                value = int(value)
+                factors = tuple(map(int, factors))
+                assert math.prod(factors) == value
+                FACTORLIST[value] = factors
 
-  n = base ** exp - 1 if exp else base
-  if n in FACTORLIST:
-    return FACTORLIST[n]
+    n = base ** exp - 1 if exp else base
+    if n in FACTORLIST:
+        return FACTORLIST[n]
 
-  if exp is None:
-    factors = _factorise_1(n)
-  else:
-    factors = _factorise_p(base, exp)
+    if exp is None:
+        factors = _factorise_1(n)
+    else:
+        factors = _factorise_p(base, exp)
 
-  assert math.prod(factors) == n
-  FACTORLIST[n] = factors
-  return factors
+    assert math.prod(factors) == n
+    FACTORLIST[n] = factors
+    if n > 0x10000000000000000:
+        with open('newfactors.txt', 'at') as f:
+            print(f'{n}: {" ".join(map(str, factors))}', file=f)
+    return factors
 
 
 def matpow(b, i, m):
@@ -150,12 +152,20 @@ def matpow(b, i, m):
 
 
 FACTORS = [2, 3, 5, 7]
+SHUSH = 0
 def test_poly(poly, base):
     global FACTORS
     def mkmat(poly):
-        return np.array( [
+        global SHUSH
+        ok64bit = base * base * len(poly) < 4000000000000000000
+        if not ok64bit and SHUSH != base:
+            print(f"matrix {len(poly)}x{len(poly)} needs larger type for mod {base}",
+                    file=sys.stderr)
+            SHUSH = base
+        dtype = np.uint64 if ok64bit else object
+        return np.matrix([
             [ int(i == j) for i in range(1, len(poly)) ] + [poly[-j-1]] for j in range(len(poly))
-        ])
+        ], dtype=dtype)
     def isidentity(mat):
         return np.all(np.equal(np.identity(len(poly)), mat))
 
@@ -188,7 +198,7 @@ def bitperm(length, bits):
         x |= mask >> x.bit_count()
 
 
-def randrange(a, b = None, c = None):
+def randrange(a, b = None, c = None, *, seed=1):
     if b is None:
         count = a
         a = 0
@@ -200,8 +210,8 @@ def randrange(a, b = None, c = None):
         count = b - a
     count //= c
 
-    x = count * 3 // 1
-    step = int(count * 0.61803398875)
+    x = (count + 5 * seed) * 31 // 101
+    step = (count - seed) * 0x9e3779b97f4a7bb5 // 0xffffffffffffffc5
     while math.gcd(step, count) > 1:
         step -= 1
     for _ in range(count):
@@ -222,21 +232,18 @@ def mkpoly(x, bitmap, base, length):
         result.insert(0, o)
     return result
 
-def one_large(bits, base, length, limit=1000000):
+
+def one_large(bits, base, length, inner_limit=1000):
     for bitmap in bitperm(length - 1, bits):
         zo = [ (bitmap >> i) & 1 for i in range(length - 1) ]
         zo.reverse()
-        for i in islice(randrange(1, base), limit):
+        for i in islice(randrange(1, base, seed=bitmap), inner_limit):
             yield zo + [i]
-        if (bitmap & 1) != 0:
-            for j in reversed(range(len(zo))):
-                for i in islice(randrange(2, base), limit // length):
-                    yield zo[:j] + [i] + zo[j:]
 
 
-def many_large(bits, base, length, limit=1000000):
+def many_large(bits, base, length, inner_limit=1000):
     for bitmap in bitperm(length - 1, bits):
-        for x in islice(randrange((base - 1) ** (bits + 1)), limit):
+        for x in islice(randrange((base - 1) ** (bits + 1), seed=bitmap), inner_limit):
             yield mkpoly(x, bitmap * 2 + 1, base, length)
 
 
@@ -254,19 +261,20 @@ def search(base, length):
     period = base ** length - 1
     print(f"Searching {base=} {length=}, {period=}", flush=True)
     try:
-      FACTORS = sorted(set(factorise(base, length)))
-      print(f"(factors={FACTORS})", flush=True)
+        FACTORS = sorted(set(factorise(base, length)))
+        print(f"(factors={FACTORS})", flush=True)
     except OverflowError as e:
-      print(f"Overflow: {e}")
-      return
+        print(f"Overflow: {e}")
+        return
 
     for gen in [ one_large, many_large ]:
         for bits in range(1, length):
-            for poly in gen(bits, base, length):
+            bailout = 10000
+            for poly in islice(gen(bits, base, length), bailout):
                 if next(slowprint):
-                    print(f"trying: {poly}, {length}", end="  \x1b[K\r", file=sys.stderr)
+                    print(f"trying: {poly}, {bits}", end="  \x1b[K\r", file=sys.stderr)
                 if test_poly(poly, base):
-                    print(f"{base=}, {length=}, {poly=}")
+                    print(f"{base=}, {length=}, {poly=}, {bits=}", flush=True)
                     break
             else:
                 print(f"\nCould not find {gen.__name__}({bits=}, {base=}, {length=})", flush=True)
