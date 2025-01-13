@@ -1,4 +1,5 @@
 import argparse
+import builtins
 from itertools import batched, chain, islice, repeat
 import math
 from operator import mul, eq
@@ -87,7 +88,7 @@ POLYS = {
 # }}}
 }
 
-def _prime_1(base, length, punctured=True, stop=False, whole_reg=False):
+def _prime_1(base, length, punctured=True, stop=False, as_=next):
   """ The most basic LFSR-based generator. """
   poly = POLYS[(base, length)]
   shift = list(_fixedlen([1], length))
@@ -105,13 +106,13 @@ def _prime_1(base, length, punctured=True, stop=False, whole_reg=False):
       return s
 
   for _ in _full_cycle(base, length, stop=stop, punctured=punctured):
-    yield shift if whole_reg else shift[0]
+    yield as_(iter(shift))
     x = sum(map(mul, shift, poly)) % base
     shift = [x] + shift[:-1]
     shift = unpuncture(shift)
 
 
-def _prime_n(base, n, length, punctured=False, stop=False, whole_reg=False):
+def _prime_n(base, n, length, punctured=False, stop=False, as_=next):
   assert n > 1  # Should call _prime_1() directly.
   # Map n values in the range 0..(base-1) to one value in 0..(base**n-1).
   def fuse(v):
@@ -133,15 +134,15 @@ def _prime_n(base, n, length, punctured=False, stop=False, whole_reg=False):
 
   # Punctured must be false here because otherwise we have no control over
   # the divisibility of the period and all our assumptions fall apart.
-  # Setting whole_reg true saves us the trouble of logging n consecutive
-  # singletons manually.
-  gen = _prime_1(base, length * n, punctured=False, stop=stop, whole_reg=True)
+  gen = _prime_1(base, length * n, punctured=False, stop=stop, as_=iter)
 
   # And off we go!
   for shift in every_nth(gen):
-    if punctured and allzeroes(shift): continue
+    if punctured:
+      shift = list(shift)
+      if allzeroes(shift): continue
     shift = map(fuse, batched(shift, n))
-    yield list(shift) if whole_reg else next(shift)
+    yield as_(shift)
 
 
 def _generic(base, power, length, **kwargs):
@@ -150,16 +151,20 @@ def _generic(base, power, length, **kwargs):
     if power == 1:
       yield from _binary_1(length, **kwargs)
     else:
-      yield from _binar_n(length, power,  **kwargs)
+      yield from _binary_n(length, power,  **kwargs)
   else:
     if power == 1:
       yield from _prime_1(base, length, **kwargs)
     else:
       yield from _prime_n(base, power, length, **kwargs)
 
-def composite(base, length, punctured=False, stop=False, whole_reg=False):
+def generate(base, length, punctured=False, stop=False, as_=next):
   factors = _factors(base)
   n = len(factors)
+  if n == 1:
+    [(p, n)] = factors.items()
+    yield from _generic(p, n, length, punctured=punctured, stop=stop, as_=as_)
+    return
   fp = [ p ** i for (p, i) in factors.items() ]
   assert base == math.prod(fp)
   assert punctured == False  # too hard to think about
@@ -170,15 +175,28 @@ def composite(base, length, punctured=False, stop=False, whole_reg=False):
     return r
 
   def delegate(p, n):
-    return _generic(p, n, length, punctured=punctured, stop=False, whole_reg=whole_reg)
+    return _generic(p, n, length, punctured=punctured, stop=False, as_=iter)
   gens = [ delegate(p, n) for (p, n) in factors.items() ]
 
   for shift in _full_cycle(base, length, punctured=punctured, stop=stop, gen=zip(*gens)):
-    print(shift, end=': ')
-    if whole_reg:
-      yield list(map(fuse, shift))
-    else:
-      yield fuse(*shift)
+    yield as_(map(fuse, zip(*shift)))
 
-for i in composite(15, 3, stop=True, whole_reg=True):
-  print(i)
+
+def main(args):
+  for base in args.base:
+    for i in generate(base, args.length, stop=True, punctured=args.punctured, as_=args.as_):
+      print(i)
+
+def fn_type(arg):
+  if arg == 'none': return lambda x: x
+  try:
+    return getattr(builtins, arg)
+  except AttributeError as e:
+    raise argparse.ArgumentTypeError(e)
+
+parser = argparse.ArgumentParser(description="Example nblfsr generator code")
+parser.add_argument('base', nargs='+', type=int, default=3)
+parser.add_argument('--length', type=int, default=3)
+parser.add_argument('--as', dest='as_', type=fn_type, default=next)
+parser.add_argument('--punctured', action='store_true')
+main(parser.parse_args())
