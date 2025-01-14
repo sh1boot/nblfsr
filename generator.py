@@ -36,6 +36,21 @@ def _fixedlen(v, length):
 
 POLYS = {
 # {{{
+  (2, 2): 0x3,
+  (2, 3): 0x6,
+  (2, 4): 0xc,
+  (2, 5): 0x14,
+  (2, 6): 0x30,
+  (2, 7): 0x60,
+  (2, 8): 0xb8,
+  (2, 9): 0x110,
+  (2, 10): 0x240,
+  (2, 11): 0x500,
+  (2, 12): 0xe08,
+  (2, 13): 0x1c80,
+  (2, 14): 0x3802,
+  (2, 15): 0x6000,
+  (2, 16): 0xd008,
   (3, 2): [1, 1],
   (3, 3): [0, 1, 2],
   (3, 4): [0, 0, 1, 1],
@@ -68,28 +83,16 @@ POLYS = {
   (11, 8): [0, 0, 0, 1, 1, 0, 0, 3],
   (13, 2): [1, 11],
   (13, 3): [1, 0, 2],
-  (13, 3): [1, 1, 7],
   (13, 4): [1, 1, 0, 2],
-  (13, 4): [1, 1, 3, 2],
   (13, 5): [1, 0, 1, 0, 2],
-  (13, 5): [1, 1, 1, 0, 2],
-  (13, 5): [1, 1, 1, 2, 6],
   (13, 6): [0, 0, 1, 1, 0, 2],
-  (13, 6): [1, 1, 0, 1, 0, 2],
-  (13, 6): [1, 0, 1, 1, 1, 2],
-  (13, 6): [1, 1, 1, 1, 1, 6],
   (13, 7): [0, 0, 1, 0, 0, 0, 2],
-  (13, 7): [0, 1, 0, 1, 0, 0, 2],
-  (13, 7): [0, 0, 0, 1, 1, 1, 2],
-  (13, 7): [0, 1, 1, 1, 1, 0, 2],
-  (13, 7): [0, 1, 1, 1, 1, 1, 2],
-  (13, 7): [1, 1, 1, 1, 1, 1, 6],
   (13, 8): [0, 0, 0, 1, 0, 0, 1, 2],
 # }}}
 }
 
 def _prime_1(base, length, punctured=True, stop=False, as_=next):
-  """ The most basic LFSR-based generator. """
+  """ The most basic non-binary LFSR-based generator. """
   poly = POLYS[(base, length)]
   shift = list(_fixedlen([1], length))
 
@@ -145,18 +148,55 @@ def _prime_n(base, n, length, punctured=False, stop=False, as_=next):
     yield as_(shift)
 
 
+def _binary_1(length, punctured=True, stop=False, as_=next):
+  poly = POLYS[(2, length)]
+  shift = 1
+  bitmask = (1 << length) - 1
+  if punctured == True:
+    unpuncture = lambda s : s
+  else:
+    def unpuncture(s):
+      if s <= 1: s = 1 - s
+      return s
+  if isinstance(as_, int):
+    step = as_
+    as_ = iter
+  else:
+    step = 1
+  retmask = (1 << step) - 1
+  for _ in _full_cycle(2, length, stop=stop, punctured=punctured):
+    yield as_((shift >> i) & retmask for i in range(0, length, step))
+    x = (shift & poly).bit_count() & 1
+    shift = ((shift << 1) + x) & bitmask
+    shift = unpuncture(shift)
+
+
+def _binary_n(n, length, punctured=True, stop=False, as_=next):
+  assert n > 1  # Should call _binary_1() directly.
+  step = n | 1  # odd to co-prime with (1 << n)
+  if stop: stop = int(stop) * step
+  every_nth = lambda g: islice(g, None, None, step)
+  gen = _binary_1(length * n, punctured=False, stop=stop, as_=n)
+  for shift in every_nth(gen):
+    if punctured:
+      shift = list(shift)
+      if allzeroes(shift): continue
+    yield as_(shift)
+
+
 def _generic(base, power, length, **kwargs):
   """ Delegate to appropriate generator function depending on parameters. """
   if base == 2:
     if power == 1:
       yield from _binary_1(length, **kwargs)
     else:
-      yield from _binary_n(length, power,  **kwargs)
+      yield from _binary_n(power, length, **kwargs)
   else:
     if power == 1:
       yield from _prime_1(base, length, **kwargs)
     else:
       yield from _prime_n(base, power, length, **kwargs)
+
 
 def generate(base, length, punctured=False, stop=False, as_=next):
   factors = _factors(base)
