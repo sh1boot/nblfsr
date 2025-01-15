@@ -123,17 +123,21 @@ def _prime_n(base, n, length, punctured=False, stop=False, as_=next):
     for d in v: r = r * base + d
     return r
 
-  # step must be co-prime to period, but the period is a power of a single
-  # prime, so a single bump always works.
-  step = n if math.gcd(base, n) == 1 else (n + 1)
+  if math.gcd(base, n) != 1:
+    # Because we plan to step in lots of n, to fuse them together, we cannot
+    # have an n which is a multiple of the period, because then we'll end up
+    # reading at the same phase n times over.  TODO: Maybe we can avoid this by
+    # setting punctured=False to make the period co-prime and unpuncturing it
+    # after fusion?
+    raise NotImplementedError("prime {base} and exponent {n} must be coprime")
 
   # Because we're taking n steps per iteration, we must repeat the sequence n
   # times before quitting (unless we're never quitting).
-  if stop: stop = int(stop) * step
+  if stop: stop = int(stop) * n
 
   # We need to consume n consecutive outputs in the source generator so that we
   # can fuse them together to geth one value in the desired range.
-  every_nth = lambda g: islice(g, None, None, step)
+  every_nth = lambda g: islice(g, None, None, n)
 
   # Punctured must be false here because otherwise we have no control over
   # the divisibility of the period and all our assumptions fall apart.
@@ -173,9 +177,10 @@ def _binary_1(length, punctured=True, stop=False, as_=next):
 
 def _binary_n(n, length, punctured=True, stop=False, as_=next):
   assert n > 1  # Should call _binary_1() directly.
-  step = n | 1  # odd to co-prime with (1 << n)
-  if stop: stop = int(stop) * step
-  every_nth = lambda g: islice(g, None, None, step)
+  if (n & 1) == 0:
+    raise NotImplementedError("prime 2 and exponent {n} must be coprime")
+  if stop: stop = int(stop) * n
+  every_nth = lambda g: islice(g, None, None, n)
   gen = _binary_1(length * n, punctured=False, stop=stop, as_=n)
   for shift in every_nth(gen):
     if punctured:
@@ -207,7 +212,8 @@ def generate(base, length, punctured=False, stop=False, as_=next):
     return
   fp = [ p ** i for (p, i) in factors.items() ]
   assert base == math.prod(fp)
-  assert punctured == False  # too hard to think about
+  if punctured != False:
+    raise NotImplementedError("punctured composite generator not implemented")
 
   def fuse(v):
     r = 0
@@ -224,8 +230,15 @@ def generate(base, length, punctured=False, stop=False, as_=next):
 
 def main(args):
   for base in args.base:
+    win = None
     for i in generate(base, args.length, stop=True, punctured=args.punctured, as_=args.as_):
       print(i)
+      if args.as_ == list:
+        if win is None:
+          win = i
+        else:
+          win = i[0:1] + win[:-1]
+        assert i[1:] == win[1:]
 
 def fn_type(arg):
   if arg == 'none': return lambda x: x
