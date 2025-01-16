@@ -91,7 +91,7 @@ POLYS = {
 # }}}
 }
 
-def _prime_1(base, length, punctured=True, stop=False, as_=next):
+def _prime_1(base, length, *, punctured, stop, as_):
   """ The most basic non-binary LFSR-based generator. """
   poly = POLYS[(base, length)]
   shift = list(_fixedlen([1], length))
@@ -115,44 +115,22 @@ def _prime_1(base, length, punctured=True, stop=False, as_=next):
     shift = unpuncture(shift)
 
 
-def _prime_n(base, n, length, punctured=False, stop=False, as_=next):
+def _prime_n(base, n, length, *, punctured, stop, as_):
   assert n > 1  # Should call _prime_1() directly.
+
   # Map n values in the range 0..(base-1) to one value in 0..(base**n-1).
   def fuse(v):
     r = 0
     for d in v: r = r * base + d
     return r
 
-  if math.gcd(base, n) != 1:
-    # Because we plan to step in lots of n, to fuse them together, we cannot
-    # have an n which is a multiple of the period, because then we'll end up
-    # reading at the same phase n times over.  TODO: Maybe we can avoid this by
-    # setting punctured=False to make the period co-prime and unpuncturing it
-    # after fusion?
-    raise NotImplementedError("prime {base} and exponent {n} must be coprime")
-
-  # Because we're taking n steps per iteration, we must repeat the sequence n
-  # times before quitting (unless we're never quitting).
-  if stop: stop = int(stop) * n
-
-  # We need to consume n consecutive outputs in the source generator so that we
-  # can fuse them together to geth one value in the desired range.
-  every_nth = lambda g: islice(g, None, None, n)
-
-  # Punctured must be false here because otherwise we have no control over
-  # the divisibility of the period and all our assumptions fall apart.
-  gen = _prime_1(base, length * n, punctured=False, stop=stop, as_=iter)
-
-  # And off we go!
-  for shift in every_nth(gen):
-    if punctured:
-      shift = list(shift)
-      if allzeroes(shift): continue
-    shift = map(fuse, batched(shift, n))
-    yield as_(shift)
+  for shift in _prime_1(base, length * n, punctured=punctured, stop=stop, as_=list):
+    if punctured and allzeroes(shift): continue
+    fused = map(fuse, (shift[i::length] for i in range(length)))
+    yield as_(fused)
 
 
-def _binary_1(length, punctured=True, stop=False, as_=next):
+def _binary_1(length, *, punctured, stop, as_):
   poly = POLYS[(2, length)]
   shift = 1
   bitmask = (1 << length) - 1
@@ -162,31 +140,26 @@ def _binary_1(length, punctured=True, stop=False, as_=next):
     def unpuncture(s):
       if s <= 1: s = 1 - s
       return s
-  if isinstance(as_, int):
-    step = as_
-    as_ = iter
-  else:
-    step = 1
-  retmask = (1 << step) - 1
   for _ in _full_cycle(2, length, stop=stop, punctured=punctured):
-    yield as_((shift >> i) & retmask for i in range(0, length, step))
+    yield as_((shift >> i) & 1 for i in range(0, length))
     x = (shift & poly).bit_count() & 1
     shift = ((shift << 1) + x) & bitmask
     shift = unpuncture(shift)
 
 
-def _binary_n(n, length, punctured=True, stop=False, as_=next):
+def _binary_n(n, length, *, punctured, stop, as_):
   assert n > 1  # Should call _binary_1() directly.
-  if (n & 1) == 0:
-    raise NotImplementedError("prime 2 and exponent {n} must be coprime")
-  if stop: stop = int(stop) * n
-  every_nth = lambda g: islice(g, None, None, n)
-  gen = _binary_1(length * n, punctured=False, stop=stop, as_=n)
-  for shift in every_nth(gen):
-    if punctured:
-      shift = list(shift)
-      if allzeroes(shift): continue
-    yield as_(shift)
+
+  # Map n bools to one value in 0..((1 << n) - 1)
+  def fuse(v):
+    r = 0
+    for d in v: r = (r << 1) | d
+    return r
+
+  for shift in _binary_1(length * n, punctured=False, stop=stop, as_=list):
+    if punctured and allzeroes(shift): continue
+    fused = map(fuse, (shift[i::length] for i in range(length)))
+    yield as_(fused)
 
 
 def _generic(base, power, length, **kwargs):
@@ -210,10 +183,8 @@ def generate(base, length, punctured=False, stop=False, as_=next):
     [(p, n)] = factors.items()
     yield from _generic(p, n, length, punctured=punctured, stop=stop, as_=as_)
     return
-  fp = [ p ** i for (p, i) in factors.items() ]
+  fp = [ p ** n for (p, n) in factors.items() ]
   assert base == math.prod(fp)
-  if punctured != False:
-    raise NotImplementedError("punctured composite generator not implemented")
 
   def fuse(v):
     r = 0
@@ -221,11 +192,16 @@ def generate(base, length, punctured=False, stop=False, as_=next):
     return r
 
   def delegate(p, n):
-    return _generic(p, n, length, punctured=punctured, stop=False, as_=iter)
+    return _generic(p, n, length, punctured=False, stop=False, as_=iter)
   gens = [ delegate(p, n) for (p, n) in factors.items() ]
 
   for shift in _full_cycle(base, length, punctured=punctured, stop=stop, gen=zip(*gens)):
-    yield as_(map(fuse, zip(*shift)))
+    fused = map(fuse, zip(*shift))
+    if punctured:
+      fused = list(fused)
+      if allzeroes(fused): continue
+      fused = iter(fused)
+    yield as_(fused)
 
 
 def main(args):
@@ -243,7 +219,17 @@ def main(args):
 def fn_type(arg):
   if arg == 'none': return lambda x: x
   try:
-    return getattr(builtins, arg)
+    function = None
+    for arg in arg.split(':'):
+      f = getattr(builtins, arg)
+      print(f, end=' ')
+      if function is None:
+        function = f
+      else:
+        g = function
+        print(g)
+        function = (lambda x,f=f,g=g: f(g(x)))
+    return function
   except AttributeError as e:
     raise argparse.ArgumentTypeError(e)
 
