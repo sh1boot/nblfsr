@@ -31,7 +31,7 @@ def is_prime(n, k=10):
             return False
     return True
 
-def factorise_backup(n, b1=10000):
+def factorise_backup(n, b1=10000, b2=1000000):
     if -1 <= n <= 1: return [n]
     if n < -1: return [-1] + factorise_backup(-n)
     wheel = [1,2,2,4,2,4,2,4,6,2,6]
@@ -48,14 +48,16 @@ def factorise_backup(n, b1=10000):
     if n == 1: return fs
     c = 1
     while not is_prime(n):
-        h = 1
-        t = 1
+        h = 3
+        t = 3
         g = 1
         while g == 1:
             h = (h ** 2 + c) % n
             h = (h ** 2 + c) % n
             t = (t ** 2 + c) % n
             g = math.gcd(t - h, n)
+            b2 -= 1
+            if b2 == 0: raise OverflowError("Too hard to factor {n}")
         if is_prime(g):
             while n % g == 0:
                 fs.append(g)
@@ -66,23 +68,75 @@ def factorise_backup(n, b1=10000):
             print(f" ### Found composite {g}, {gfs}, {n%g}")
             assert n % g == 0
             while n % g == 0:
-                fs += gfs
+                fs.extend(gfs)
                 n //= g
         c += 1
     fs.append(n)
     return fs
 
 
-def factorise(n):
-    timeout = 180
-    if timeout > 0:
+def _factorise_1(n):
+      timeout = 180
+      if timeout > 0:
         try:
-            result = subprocess.check_output(["factor", str(n)], timeout=timeout, text=True)
-            return list(map(int, result.split(' ')[1:]))
+          factors = subprocess.check_output(["factor", str(n)], timeout=timeout, text=True)
+          return tuple(map(int, factors.split(' ')[1:]))
+        except subprocess.CalledProcessError as e:
+          print(f"factor command failed: {e}")
         except subprocess.TimeoutExpired:
-            pass
-        print(f"Oh no!  Commandline `factor` couldn`t handle {n}.", flush=True, file=sys.stderr)
-    return factorise_backup(n)
+          print(f"timeout while waiting for factor {n}", flush=True, file=sys.stderr)
+      return tuple(sorted(factorise_backup(n)))
+
+
+def _factorise_p(base, exp):
+  def allfactors(n):
+    halfway = int(math.sqrt(n))
+    for i in range(2, halfway):
+      if n % i == 0: yield i
+    for i in range(halfway, 1, -1):
+      if n % i == 0: yield n // i
+
+  seen = set()
+  factors = []
+  n = base ** exp - 1
+  for f in allfactors(exp):
+    newprimes = set(factorise(base, f)) - seen
+    seen |= newprimes
+    for p in newprimes:
+      while n % p == 0:
+        n //= p
+        factors.append(p)
+    if n == 1: break
+  if n > 1: factors.extend(factorise(n))
+  factors.sort()
+  return factors
+
+
+FACTORLIST = {}
+def factorise(base, exp=None):
+  global FACTORLIST
+  if len(FACTORLIST) == 0:
+    with open('factorlist.txt', 'rt') as f:
+      for line in f:
+        value, factors = line.split(':')
+        factors = factors.strip().split(' ')
+        value = int(value)
+        factors = tuple(map(int, factors))
+        assert math.prod(factors) == value
+        FACTORLIST[value] = factors
+
+  n = base ** exp - 1 if exp else base
+  if n in FACTORLIST:
+    return FACTORLIST[n]
+
+  if exp is None:
+    factors = _factorise_1(n)
+  else:
+    factors = _factorise_p(base, exp)
+
+  assert math.prod(factors) == n
+  FACTORLIST[n] = factors
+  return factors
 
 
 def matpow(b, i, m):
@@ -119,7 +173,9 @@ def test_poly(poly, base):
                     return False
                 while factors % factor == 0: factors //= factor
         if factors == 1: break
-        FACTORS = sorted(set(factorise(period)))
+        # Not expected to be needed provided the global has been set up
+        # beforehand.
+        FACTORS = sorted(set(factorise(base, len(poly))))
     return True
 
 
@@ -197,8 +253,13 @@ def search(base, length):
     slowprint = ratelimit(0.2)
     period = base ** length - 1
     print(f"Searching {base=} {length=}, {period=}", flush=True)
-    FACTORS = sorted(set(factorise(period)))
-    print(f"(factors={FACTORS})", flush=True)
+    try:
+      FACTORS = sorted(set(factorise(base, length)))
+      print(f"(factors={FACTORS})", flush=True)
+    except OverflowError as e:
+      print(f"Overflow: {e}")
+      return
+
     for gen in [ one_large, many_large ]:
         for bits in range(1, length):
             for poly in gen(bits, base, length):
