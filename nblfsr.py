@@ -141,7 +141,43 @@ def factorise(base, exp=None):
     return factors
 
 
+def matpow_wide(b, i, m):
+    m = np.uint64(m)
+    m24 = np.uint64(1 << 24) % m
+    m48 = np.uint64(m24 << np.uint64(24)) % m
+    def matmul(a, b, m):
+        alo = a & np.uint64(0x00ffffff)
+        ahi = a >> np.uint64(24)
+        blo = b & np.uint64(0x00ffffff)
+        bhi = b >> np.uint64(24)
+        lo = alo @ blo
+        md = alo @ bhi + ahi @ blo
+        hi = ahi @ bhi
+        md += lo >> np.uint64(24)
+        lo &= np.uint64(0x00ffffff)
+        hi += md >> np.uint64(24)
+        md &= np.uint64(0x00ffffff)
+        md = md * m24 % m
+        hi = hi * m48 % m
+        return (lo + md + hi) % m
+
+    p = np.identity(b.shape[0], dtype=b.dtype)
+    while i > 0:
+        i, z = divmod(i, 2)
+        if z != 0:
+            p = matmul(p, b, m)
+        b = matmul(b, b, m)
+    return p
+
+SHUSH = 0
 def matpow(b, i, m):
+    if (m - 1) * (m - 1) * b.shape[0] > 0xffffffffffffffff:
+        global SHUSH
+        if SHUSH != m:
+            print(f"Doing {b.shape[0]}^2 matrix mod {m} the hard way.", file=sys.stderr, flush=True)
+            SHUSH = m
+        return matpow_wide(b, i, m)
+
     p = np.identity(b.shape[0], dtype=b.dtype)
     while i > 0:
         i, z = divmod(i, 2)
@@ -152,24 +188,14 @@ def matpow(b, i, m):
 
 
 FACTORS = [2, 3, 5, 7]
-SHUSH = 0
 def test_poly(poly, base):
     global FACTORS
-    def mkmat(poly):
-        global SHUSH
-        ok64bit = base * base * len(poly) < 4000000000000000000
-        if not ok64bit and SHUSH != base:
-            print(f"matrix {len(poly)}x{len(poly)} needs larger type for mod {base}",
-                    file=sys.stderr)
-            SHUSH = base
-        dtype = np.uint64 if ok64bit else object
-        return np.matrix([
-            [ int(i == j) for i in range(1, len(poly)) ] + [poly[-j-1]] for j in range(len(poly))
-        ], dtype=dtype)
     def isidentity(mat):
         return np.all(np.equal(np.identity(len(poly)), mat))
 
-    mat = mkmat(poly)
+    mat = np.array([
+            [ int(i == j) for i in range(1, len(poly)) ] + [poly[-j-1]] for j in range(len(poly))
+        ], dtype=np.uint64)
     period = base ** len(poly) - 1
 
     if not isidentity(matpow(mat, period, base)):
@@ -255,6 +281,16 @@ def ratelimit(step):
             yield False
 
 
+def getfactors(base, length):
+    period = base ** length - 1
+    print(f"Factorising {base}^{length}-1: {period}", file=sys.stderr, flush=True)
+    try:
+        factors = factorise(base, length)
+        print(f"{period}: {factors}", flush=True)
+    except OverflowError as e:
+        print(f"Overflow: {e}", file=sys.stderr, flush=True)
+
+
 def search(base, length):
     global FACTORS
     slowprint = ratelimit(0.2)
@@ -283,7 +319,10 @@ def search(base, length):
 def main(args):
     for length in args.lengths:
         for p in map(int, args.bases):
-            search(p, length)
+            if args.factorise:
+                getfactors(p, length)
+            else:
+                search(p, length)
 
 
 def range_type(arg):
@@ -292,7 +331,6 @@ def range_type(arg):
             start, end = map(int, s.split('-'))
             if start > end:
                 raise ValueError("Invalid range: start must be less than or equal to end")
-            print(f'{start=},{end=}')
             return range(start, end + 1)
         return [int(s)]
     return chain(*map(int_or_range, arg.split(',')))
@@ -301,4 +339,5 @@ def range_type(arg):
 parser = argparse.ArgumentParser(description="Find polynomials for non-binary LFSRs")
 parser.add_argument('bases', nargs='+', type=int)
 parser.add_argument('--length', dest='lengths', type=range_type, default=range(2,24))
+parser.add_argument('--factorise', default=False, action='store_true')
 main(parser.parse_args())
