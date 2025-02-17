@@ -6,8 +6,9 @@ import subprocess
 import sys
 import time
 import numpy as np
+import requests
 
-def is_prime(n, k=10):
+def is_prime(n, k=30):
     if n < 2: return False
     primes = [2,3,5,7,11,13,17,19,23,29]
     if any(map(lambda p: n % p == 0, primes)):
@@ -75,17 +76,63 @@ def factorise_backup(n, b1=10000, b2=1000000):
     return fs
 
 
+FACTORLIST = {}
+def loadfactors():
+    with open('factorlist.txt', 'rt') as f:
+        for line in f:
+            line = line.split('#', 1)[0]
+            value, factors = line.split(':')
+            factors = factors.strip().split(' ')
+            value = int(value)
+            factors = tuple(map(int, factors))
+            product = math.prod(factors)
+            if value != product:
+                print(f"Incorrect factors of {value}: {factors} -- sed -e 's/^{value}: /{product}: /'", file=sys.stderr)
+                print(f"{product}: {factors}")
+                value = product
+            FACTORLIST[value] = factors
+
+
+def _factorise_db(n):
+    endpoint = 'https://factordb.com/api'
+    reply = requests.get(endpoint, params={"query": str(n)})
+    if reply.status_code != 200:
+        raise OverflowError(f"factordb query={n} returned {reply.status_code}: {reply=}")
+    result = reply.json()
+    status = result['status']
+    if status != 'FF' and status != 'P' and status != 'PRP':
+        raise OverflowError(f"factordb has not fully factored {n}: {status=}, {result['id']=}")
+    factors = result['factors']
+    print(f"factordb: {status=}, {n=}, {result['id']=}, {factors=}", end=' ', file=sys.stderr)
+    factors = tuple(int(x) for x, p in factors for _ in range(p))
+    print(f"{factors=}", file=sys.stderr)
+    return factors
+
+
+FACTOR_TIMEOUT = 180
 def _factorise_1(n):
-    timeout = 180
-    if timeout > 0:
+    if FACTOR_TIMEOUT < 0:
+        raise OverflowError("skipped")
+    if FACTOR_TIMEOUT > 0:
         try:
-            factors = subprocess.check_output(["factor", str(n)], timeout=timeout, text=True)
+            factors = subprocess.check_output(["factor", str(n)], timeout=FACTOR_TIMEOUT, text=True)
             return tuple(map(int, factors.split(' ')[1:]))
         except subprocess.CalledProcessError as e:
             print(f"factor command failed: {e}")
         except subprocess.TimeoutExpired:
             print(f"timeout while waiting for factor {n}", flush=True, file=sys.stderr)
-    return tuple(sorted(factorise_backup(n)))
+    try:
+        return tuple(sorted(_factorise_db(n)))
+    except OverflowError as e:
+        print(f"factordb failed: {e}")
+    try:
+        return tuple(sorted(factorise_backup(n)))
+    except OverflowError as e:
+        # see if the list has been updated externally with something helpful
+        loadfactors()
+        if n not in FACTORLIST:
+            raise e
+        return FACTORLIST[n]
 
 
 def _factorise_p(base, exp):
@@ -112,17 +159,9 @@ def _factorise_p(base, exp):
     return factors
 
 
-FACTORLIST = {}
 def factorise(base, exp=None):
     if len(FACTORLIST) == 0:
-        with open('factorlist.txt', 'rt') as f:
-            for line in f:
-                value, factors = line.split(':')
-                factors = factors.strip().split(' ')
-                value = int(value)
-                factors = tuple(map(int, factors))
-                assert math.prod(factors) == value
-                FACTORLIST[value] = factors
+        loadfactors()
 
     n = base ** exp - 1 if exp else base
     if n in FACTORLIST:
@@ -131,11 +170,14 @@ def factorise(base, exp=None):
     if exp is None:
         factors = _factorise_1(n)
     else:
-        factors = _factorise_p(base, exp)
+        try:
+            factors = _factorise_p(base, exp)
+        except OverflowError:
+            factors = _factorise_db(f"{base}^{exp}-1")
 
     assert math.prod(factors) == n
     FACTORLIST[n] = factors
-    if n > 0x10000000000000000:
+    if exp or n > 0x10000000000000000:
         with open('newfactors.txt', 'at') as f:
             print(f'{n}: {" ".join(map(str, factors))}', file=f)
     return factors
@@ -286,9 +328,9 @@ def getfactors(base, length):
     print(f"Factorising {base}^{length}-1: {period}", file=sys.stderr, flush=True)
     try:
         factors = factorise(base, length)
-        print(f"{period}: {factors}", flush=True)
+        print(f"{base}^{length}-1={period}: {' '.join(map(str, factors))}", flush=True)
     except OverflowError as e:
-        print(f"Overflow: {e}", file=sys.stderr, flush=True)
+        print(f"{base}^{length}-1={period}: Overflow: {e}", flush=True)
 
 
 def search(base, length):
@@ -317,12 +359,15 @@ def search(base, length):
 
 
 def main(args):
+    global FACTOR_TIMEOUT
+    FACTOR_TIMEOUT = args.factor_timeout
     for length in args.lengths:
         for p in map(int, args.bases):
-            if args.factorise:
-                getfactors(p, length)
-            else:
-                search(p, length)
+            if not args.ceiling or p ** (length - 1) < args.ceiling:
+                if args.factorise:
+                    getfactors(p, length)
+                else:
+                    search(p, length)
 
 
 def range_type(arg):
@@ -340,4 +385,6 @@ parser = argparse.ArgumentParser(description="Find polynomials for non-binary LF
 parser.add_argument('bases', nargs='+', type=int)
 parser.add_argument('--length', dest='lengths', type=range_type, default=range(2,24))
 parser.add_argument('--factorise', default=False, action='store_true')
+parser.add_argument('--factor-timeout', type=int, default=180)
+parser.add_argument('--ceiling', type=eval, default=None)  # TODO: something less dangerous
 main(parser.parse_args())
