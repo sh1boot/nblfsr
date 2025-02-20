@@ -137,7 +137,7 @@ def _factorise_1(n):
 
 def _factorise_p(base, exp):
     def allfactors(n):
-        halfway = int(math.sqrt(n))
+        halfway = math.isqrt(n)
         for i in range(2, halfway):
             if n % i == 0: yield i
         for i in range(halfway, 1, -1):
@@ -182,43 +182,96 @@ def factorise(base, exp=None):
             print(f'{n}: {" ".join(map(str, factors))}', file=f)
     return factors
 
-
+SHUSH = 0
+WIDE_DTYPE = 'uint64'
 def matpow_wide(b, i, m):
-    m = np.uint64(m)
-    m24 = np.uint64(1 << 24) % m
-    m48 = np.uint64(m24 << np.uint64(24)) % m
-    def matmul(a, b, m):
-        alo = a & np.uint64(0x00ffffff)
-        ahi = a >> np.uint64(24)
-        blo = b & np.uint64(0x00ffffff)
-        bhi = b >> np.uint64(24)
+    dim = b.shape[0]
+
+    # largest acceptable value in a matrix of size dim x dim
+    max_value = math.isqrt(0xffffffffffffffff // dim)
+
+    # largest power of two not exceeding that
+    shift = (max_value + 1).bit_length() - 1
+    mask = (1 << shift) - 1
+
+    # number of chunks values must be broken into to avoid overflow
+    stages = (int(m).bit_length() + shift - 1) // shift
+    # if it's just one chunk we don't need to do anything special
+
+    if SHUSH != m:
+        shl_step = 64 - int(m).bit_length()
+        shl_steps = (shift * 2 - 1) // shl_step
+        print(f"{dim=}, {max_value=}, {shift=}, {stages=}, {shl_steps=}", file=sys.stderr, flush=True)
+
+    def matmul_wide(a, b, m):
+        if WIDE_DTYPE == 'object':
+            return (a.astype(object) @ b.astype(object) % m).astype(np.uint64)
+        if stages == 1:
+            return a @ b % m
+        # if it's more than two chunks this code isn't special enough
+        if stages > 2:
+            raise NotImplementedError(f"Need {stages=} implementation.")
+
+        # Quick-and-dirty solution to implementing the shift left within the
+        # modular range.
+        def modshl(x, i, m=m, step=64-int(m).bit_length()):
+            while i > 0:
+                step = min(step, i)
+                x %= m
+                x <<= step
+                i -= step
+
+            # TODO: fix this version
+            #mhi = m >> i
+            #mlo = m & ((1 << i) - 1)
+            #assert mhi > 0
+            #assert (x >= 0).all()
+            #d, x = np.divmod(x, mhi)
+            #x <<= i
+            #x += m - d * mlo
+
+            x %= m  # TODO: this can surely be optimised away
+            return x
+
+        alo = (a & mask).astype(np.uint64, casting='safe')
+        ahi = (a >> shift).astype(np.uint64, casting='safe')
+        blo = (b & mask).astype(np.uint64, casting='safe')
+        bhi = (b >> shift).astype(np.uint64, casting='safe')
+
+        # the matrix multiply operations:
         lo = alo @ blo
-        md = alo @ bhi + ahi @ blo
+        m0 = ahi @ blo
+        m1 = alo @ bhi
         hi = ahi @ bhi
-        md += lo >> np.uint64(24)
-        lo &= np.uint64(0x00ffffff)
-        hi += md >> np.uint64(24)
-        md &= np.uint64(0x00ffffff)
-        md = md * m24 % m
-        hi = hi * m48 % m
-        return (lo + md + hi) % m
+
+        c = lo >> shift
+        lo &= mask
+        c += (m0 & mask) + (m1 & mask)
+        lo += modshl((c & mask), shift)
+        c >>= shift
+        c += (m0 >> shift) + (m1 >> shift)
+        hi += c
+        hi = modshl(hi, shift * 2)
+        #hi = modshl(modshl(hi, shift), shift)
+        return (lo + hi) % m
 
     p = np.identity(b.shape[0], dtype=b.dtype)
     while i > 0:
         i, z = divmod(i, 2)
         if z != 0:
-            p = matmul(p, b, m)
-        b = matmul(b, b, m)
+            p = matmul_wide(p, b, m)
+        b = matmul_wide(b, b, m)
     return p
 
-SHUSH = 0
 def matpow(b, i, m):
     if (m - 1) * (m - 1) * b.shape[0] > 0xffffffffffffffff:
         global SHUSH
         if SHUSH != m:
             print(f"Doing {b.shape[0]}^2 matrix mod {m} the hard way.", file=sys.stderr, flush=True)
+        result = matpow_wide(b, i, m)
+        if SHUSH != m:
             SHUSH = m
-        return matpow_wide(b, i, m)
+        return result
 
     p = np.identity(b.shape[0], dtype=b.dtype)
     while i > 0:
@@ -360,7 +413,9 @@ def search(base, length):
 
 def main(args):
     global FACTOR_TIMEOUT
+    global WIDE_DTYPE
     FACTOR_TIMEOUT = args.factor_timeout
+    WIDE_DTYPE = args.wide_dtype
     for length in args.lengths:
         for p in map(int, args.bases):
             if not args.ceiling or p ** (length - 1) < args.ceiling:
@@ -386,5 +441,6 @@ parser.add_argument('bases', nargs='+', type=int)
 parser.add_argument('--length', dest='lengths', type=range_type, default=range(2,24))
 parser.add_argument('--factorise', default=False, action='store_true')
 parser.add_argument('--factor-timeout', type=int, default=180)
+parser.add_argument('--wide-dtype', type=str, default='uint64', choices=['uint64', 'object'])
 parser.add_argument('--ceiling', type=eval, default=None)  # TODO: something less dangerous
 main(parser.parse_args())
