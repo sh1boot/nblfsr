@@ -1,10 +1,12 @@
 import argparse
+import functools
 from itertools import islice, chain
 import math
 import random
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 import numpy as np
 import requests
 
@@ -109,7 +111,6 @@ def _factorise_db(n):
     return factors
 
 
-FACTOR_TIMEOUT = 180
 def _factorise_1(n):
     if FACTOR_TIMEOUT < 0:
         raise OverflowError("skipped")
@@ -182,103 +183,145 @@ def factorise(base, exp=None):
             print(f'{n}: {" ".join(map(str, factors))}', file=f)
     return factors
 
-SHUSH = 0
-WIDE_DTYPE = 'uint64'
-def matpow_wide(b, i, m):
-    dim = b.shape[0]
 
-    # largest acceptable value in a matrix of size dim x dim
-    max_value = math.isqrt(0xffffffffffffffff // dim)
+@functools.cache
+def matmul_configure(m, d):
+    max_product = (m - 1) * (m - 1) * d
+    # If m is a power of two (ie., a factor of implicit overflow), we can just
+    # let overflow happen.
+    if m.bit_count() == 1: max_product = m
+    if max_product.bit_length() < 64:
+        if max_product.bit_length() < 16:
+            return SimpleNamespace(delegate=np.uint16)
+        elif max_product.bit_length() < 32:
+            return SimpleNamespace(delegate=np.uint32)
+        return SimpleNamespace(delegate=np.uint64)
+
+    # largest acceptable value in a matrix of size d x d
+    max_input = math.isqrt(0xffffffffffffffff // d)
 
     # largest power of two not exceeding that
-    shift = (max_value + 1).bit_length() - 1
+    max_shift = (max_input + 1).bit_length() - 1
+
+    # minimum number of bits we need to shift down to avoid overflow
+    shift = (max_product.bit_length() - 63) // 2
+    # but never so many that overflow could happen
+    shift = min(shift, max_shift)
+    assert shift > 0
     mask = (1 << shift) - 1
 
     # number of chunks values must be broken into to avoid overflow
-    stages = (int(m).bit_length() + shift - 1) // shift
-    # if it's just one chunk we don't need to do anything special
+    # stages = ((m.bit_length() - 1) // shift) + 1
+    stages = (max_product.bit_length() - 63) // (shift * 2) + 1
 
-    if SHUSH != m:
-        shl_step = 64 - int(m).bit_length()
-        shl_steps = (shift * 2 - 1) // shl_step
-        print(f"{dim=}, {max_value=}, {shift=}, {stages=}, {shl_steps=}", file=sys.stderr, flush=True)
+    # should have ruled out 1-stage at top of function
+    assert stages > 1
 
-    def matmul_wide(a, b, m):
-        if WIDE_DTYPE == 'object':
-            return (a.astype(object) @ b.astype(object) % m).astype(np.uint64)
-        if stages == 1:
-            return a @ b % m
-        # if it's more than two chunks this code isn't special enough
-        if stages > 2:
-            raise NotImplementedError(f"Need {stages=} implementation.")
+    # if it's more than two chunks this code isn't special enough
+    if stages > 2 or WIDE_DTYPE == 'object':
+        delegate = object
+    else:
+        delegate = None
 
-        # Quick-and-dirty solution to implementing the shift left within the
-        # modular range.
-        def modshl(x, i, m=m, step=64-int(m).bit_length()):
-            while i > 0:
-                step = min(step, i)
-                x %= m
-                x <<= step
-                i -= step
+    # In circumstances where an arbitrary 64-bit input can come in to modshl(),
+    # the algorithm we use would have an integer overflow if mlo was greater
+    # than mhi, because we calculate a temporary: d = (x // mhi) * mlo
+    def get_shl_step(max_x = 0xffffffffffffffff):
+        step = shift
+        while True:
+            mhi = m >> step
+            mlo = m & ((1 << step) - 1)
+            if (max_x // mhi * mlo).bit_length() < 64:
+                return step
+            step -= 1
 
-            # TODO: fix this version
-            #mhi = m >> i
-            #mlo = m & ((1 << i) - 1)
-            #assert mhi > 0
-            #assert (x >= 0).all()
-            #d, x = np.divmod(x, mhi)
-            #x <<= i
-            #x += m - d * mlo
+    shl_step_worstcase = get_shl_step()
 
-            x %= m  # TODO: this can surely be optimised away
-            return x
+    m_top = (m - 1) >> shift
+    max_bot_prod = mask * mask * d
+    max_mid_prod = m_top * mask * d
+    max_top_prod = m_top * m_top * d
+    result = SimpleNamespace(
+            m=m,
+            d=d,
+            delegate=delegate,
+            shift=shift,
+            mask=mask,
+            shl_step_worstcase=shl_step_worstcase
+    )
+    notes = SimpleNamespace(
+                stages=stages,
+                max_bot_prod=max_bot_prod.bit_length(),
+                max_mid_prod=max_mid_prod.bit_length(),
+                max_top_prod=max_top_prod.bit_length(),
+            )
+    print(f"matmul cfg: {max_product=:#x} {max_input=:#x}, {result},\n  {notes}", file=sys.stderr, flush=True)
+    return result
 
-        alo = (a & mask).astype(np.uint64, casting='safe')
-        ahi = (a >> shift).astype(np.uint64, casting='safe')
-        blo = (b & mask).astype(np.uint64, casting='safe')
-        bhi = (b >> shift).astype(np.uint64, casting='safe')
 
-        # the matrix multiply operations:
-        lo = alo @ blo
-        m0 = ahi @ blo
-        m1 = alo @ bhi
-        hi = ahi @ bhi
+def matmul_4step(a, b, m, cfg):
+    def modshl(x, i, max_x = 0xffffffffffffffff):
+        # ref = ((x.astype(object) << i) % m).astype(np.uint64)
+        while i > 0:
+            if max_x.bit_length() + i < 64:
+                return (x << i) % m
+            # Ideally: maximise step such that:
+            #   max_x // (m >> step) < 0xffffffffffffffff // (m & ((1 << step) - 1))
+            # but we just pre-compute a safe value into cfg.shl_step_worstcase.
+            step = min(cfg.shl_step_worstcase, i)
+            mhi = m >> step
+            mlo = m & ((1 << step) - 1)
+            d, x = np.divmod(x, mhi)
+            d *= mlo
+            x <<= step
+            x += m - d % m
+            x %= m
+            max_x = m
+            i -= step
+        # assert (x == ref).all()
+        return x
 
-        c = lo >> shift
-        lo &= mask
-        c += (m0 & mask) + (m1 & mask)
-        lo += modshl((c & mask), shift)
-        c >>= shift
-        c += (m0 >> shift) + (m1 >> shift)
-        hi += c
-        hi = modshl(hi, shift * 2)
-        #hi = modshl(modshl(hi, shift), shift)
-        return (lo + hi) % m
+    alo = (a & cfg.mask).astype(np.uint64, casting='safe')
+    ahi = (a >> cfg.shift).astype(np.uint64, casting='safe')
+    blo = (b & cfg.mask).astype(np.uint64, casting='safe')
+    bhi = (b >> cfg.shift).astype(np.uint64, casting='safe')
 
-    p = np.identity(b.shape[0], dtype=b.dtype)
-    while i > 0:
-        i, z = divmod(i, 2)
-        if z != 0:
-            p = matmul_wide(p, b, m)
-        b = matmul_wide(b, b, m)
-    return p
+    # the matrix multiply operations:
+    lo = alo @ blo                  # max: max_bot_prod
+    m0 = ahi @ blo                  # max: max_mid_prod
+    m1 = alo @ bhi                  # max: max_mid_prod
+    hi = ahi @ bhi                  # max: max_top_prod
+
+    c = lo >> cfg.shift             # max ~= mask * d
+    lo &= cfg.mask                  # max = mask
+    c += (m0 & cfg.mask) + (m1 & cfg.mask)  # max ~= mask * (d + 2)
+    clo = c & cfg.mask              # max = mask
+    chi = c >> cfg.shift            # max ~= (d + 2)
+    chi += (m0 >> cfg.shift) + (m1 >> cfg.shift)  # max = m_top * d * 2 + d + 2
+    chi += hi                       # max = m_top * d * 2 + d + 2 + max_top_prod
+    c = clo + modshl(chi, cfg.shift)  # max = m - 1 + mask
+    lo += modshl(c, cfg.shift, m + cfg.mask)
+    result = lo % m
+    # ref = (a.astype(object) @ b.astype(object) % m).astype(np.uint64)
+    # assert (result == ref).all(), f"{result=}, {ref=}"
+    return result
 
 def matpow(b, i, m):
-    if (m - 1) * (m - 1) * b.shape[0] > 0xffffffffffffffff:
-        global SHUSH
-        if SHUSH != m:
-            print(f"Doing {b.shape[0]}^2 matrix mod {m} the hard way.", file=sys.stderr, flush=True)
-        result = matpow_wide(b, i, m)
-        if SHUSH != m:
-            SHUSH = m
-        return result
+    cfg = matmul_configure(m, b.shape[0])
+    if cfg.delegate:
+        def matmul(a, b, m):
+            return (a.astype(cfg.delegate, copy=False) @
+                    b.astype(cfg.delegate, copy=False)) % m
+    else:
+        def matmul(a, b, m):
+            return matmul_4step(a, b, m, cfg)
 
     p = np.identity(b.shape[0], dtype=b.dtype)
     while i > 0:
         i, z = divmod(i, 2)
         if z != 0:
-            p = p @ b % m
-        b = b @ b % m
+            p = matmul(p, b, m)
+        b = matmul(b, b, m)
     return p
 
 
