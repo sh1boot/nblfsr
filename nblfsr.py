@@ -2,6 +2,7 @@ import argparse
 import functools
 from itertools import islice, chain
 import math
+import os
 import random
 import subprocess
 import sys
@@ -80,29 +81,33 @@ def factorise_backup(n, b1=10000, b2=1000000):
 
 FACTORLIST = {}
 def loadfactors():
-    with open('factorlist.txt', 'rt') as f:
-        for line in f:
-            line = line.split('#', 1)[0]
-            value, factors = line.split(':')
-            factors = factors.strip().split(' ')
-            value = int(value)
-            factors = tuple(map(int, factors))
-            product = math.prod(factors)
-            if value != product:
-                print(f"Incorrect factors of {value}: {factors} -- sed -e 's/^{value}: /{product}: /'", file=sys.stderr)
-                print(f"{product}: {factors}")
-                value = product
-            FACTORLIST[value] = factors
+    try:
+        with open('factorlist.txt', 'rt', encoding='ascii') as f:
+            for line in f:
+                line = line.split('#', 1)[0]
+                value, factors = line.split(':')
+                factors = factors.strip().split(' ')
+                value = int(value)
+                factors = tuple(map(int, factors))
+                product = math.prod(factors)
+                if value != product:
+                    print(f"Incorrect factors of {value}:"
+                            " {factors} -- sed -e 's/^{value}: /{product}: /'", file=sys.stderr)
+                    print(f"{product}: {factors}")
+                    value = product
+                FACTORLIST[value] = factors
+    except FileNotFoundError:
+        pass
 
 
 def _factorise_db(n):
     endpoint = 'https://factordb.com/api'
-    reply = requests.get(endpoint, params={"query": str(n)})
+    reply = requests.get(endpoint, params={"query": str(n)}, timeout=60)
     if reply.status_code != 200:
         raise OverflowError(f"factordb query={n} returned {reply.status_code}: {reply=}")
     result = reply.json()
     status = result['status']
-    if status != 'FF' and status != 'P' and status != 'PRP':
+    if status not in ('FF', 'P', 'PRP'):
         raise OverflowError(f"factordb has not fully factored {n}: {status=}, {result['id']=}")
     factors = result['factors']
     print(f"factordb: {status=}, {n=}, {result['id']=}, {factors=}", end=' ', file=sys.stderr)
@@ -179,7 +184,7 @@ def factorise(base, exp=None):
     assert math.prod(factors) == n
     FACTORLIST[n] = factors
     if exp or n > 0x10000000000000000:
-        with open('newfactors.txt', 'at') as f:
+        with open('newfactors.txt', 'at', encoding='ascii') as f:
             print(f'{n}: {" ".join(map(str, factors))}', file=f)
     return factors
 
@@ -193,7 +198,7 @@ def matmul_configure(m, d):
     if max_product.bit_length() < 64:
         if max_product.bit_length() < 16:
             return SimpleNamespace(delegate=np.uint16)
-        elif max_product.bit_length() < 32:
+        if max_product.bit_length() < 32:
             return SimpleNamespace(delegate=np.uint32)
         return SimpleNamespace(delegate=np.uint64)
 
@@ -255,7 +260,8 @@ def matmul_configure(m, d):
                 max_mid_prod=max_mid_prod.bit_length(),
                 max_top_prod=max_top_prod.bit_length(),
             )
-    print(f"matmul cfg: {max_product=:#x} {max_input=:#x}, {result},\n  {notes}", file=sys.stderr, flush=True)
+    print(f"matmul cfg: {max_product=:#x} {max_input=:#x}, {result},\n  {notes}",
+            file=sys.stderr, flush=True)
     return result
 
 
@@ -411,6 +417,17 @@ def many_large(bits, base, length, inner_limit=1000):
             yield mkpoly(x, bitmap * 2 + 1, base, length)
 
 
+def just_ones(bits, base, length):
+    for i in chain([1, base-1], range(2, min(base - 1, 5))):
+        for bitmap in bitperm(length - 1, bits):
+            zo = [ (bitmap >> i) & 1 for i in range(length - 1) ]
+            zo.reverse()
+            yield zo + [i]
+
+
+GENERATORS = { f.__name__: f for f in [ one_large, many_large, just_ones ] }
+
+
 def ratelimit(step):
     while True:
         tick = time.time() + step
@@ -429,29 +446,35 @@ def getfactors(base, length):
         print(f"{base}^{length}-1={period}: Overflow: {e}", flush=True)
 
 
-def search(base, length):
+def search(base, length, bit_range=None, generators=None):
     global FACTORS
     slowprint = ratelimit(0.2)
     period = base ** length - 1
     print(f"Searching {base=} {length=}, {period=}", flush=True)
     try:
         FACTORS = sorted(set(factorise(base, length)))
-        print(f"(factors={FACTORS})", flush=True)
+        print(f"Factors of {base}**{length}-1: {period}: {' '.join(map(str, FACTORS))}", flush=True)
     except OverflowError as e:
         print(f"Overflow: {e}")
         return
 
-    for gen in [ one_large, many_large ]:
-        for bits in range(1, length):
+    for gen in generators or GENERATORS.values():
+        for bits in bit_range or range(1, length):
             bailout = 10000
             for poly in islice(gen(bits, base, length), bailout):
                 if next(slowprint):
-                    print(f"trying: {poly}, {bits}", end="  \x1b[K\r", file=sys.stderr)
+                    if sys.stderr.isatty():
+                        width = os.get_terminal_size(sys.stderr.fileno()).columns - 20
+                    else:
+                        width = 0
+                    print(f"trying: {str(poly)[-width:]}, {bits}", end="  \x1b[K\r",
+                            file=sys.stderr)
                 if test_poly(poly, base):
                     print(f"{base=}, {length=}, {poly=}, {bits=}", flush=True)
                     break
             else:
-                print(f"\nCould not find {gen.__name__}({bits=}, {base=}, {length=})", flush=True)
+                print('\r', end="\x1b[K", file=sys.stderr)
+                print(f"Could not find {gen.__name__}({bits=}, {base=}, {length=})", flush=True)
 
 
 def main(args):
@@ -465,7 +488,7 @@ def main(args):
                 if args.factorise:
                     getfactors(p, length)
                 else:
-                    search(p, length)
+                    search(p, length, args.pop_counts, args.generators)
 
 
 def range_type(arg):
@@ -476,14 +499,22 @@ def range_type(arg):
                 raise ValueError("Invalid range: start must be less than or equal to end")
             return range(start, end + 1)
         return [int(s)]
-    return chain(*map(int_or_range, arg.split(',')))
+    return tuple(chain(*map(int_or_range, arg.split(','))))
 
+def argparse_lookup(d, name):
+    try:
+        return d[name]
+    except KeyError as exc:
+        raise argparse.ArgumentTypeError(f'unknown value {name}') from exc
 
 parser = argparse.ArgumentParser(description="Find polynomials for non-binary LFSRs")
 parser.add_argument('bases', nargs='+', type=int)
-parser.add_argument('--length', dest='lengths', type=range_type, default=range(2,24))
+parser.add_argument('--lengths', '--length', type=range_type, default=range(2,24))
 parser.add_argument('--factorise', default=False, action='store_true')
 parser.add_argument('--factor-timeout', type=int, default=180)
 parser.add_argument('--wide-dtype', type=str, default='uint64', choices=['uint64', 'object'])
 parser.add_argument('--ceiling', type=eval, default=None)  # TODO: something less dangerous
+parser.add_argument('--pop-counts', '--pop-count', type=range_type, default=None)
+parser.add_argument('--generators', '--generator',
+        type=lambda s: [argparse_lookup(GENERATORS, f) for f in s.split(',')], default=None)
 main(parser.parse_args())
